@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# generated at runtime by the extension
+webui.key
+webui.cert
+webui.bundle
