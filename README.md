@@ -3,18 +3,26 @@
  
  Extension implementation of https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/4417
  
+ Works on AUTOMATIC1111-style WebUIs and on [Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo).
+ 
  *This extension is **not** intended for use with Google **Collab** instances.*
  
 ### Usecase 1 - Automatic(Default):
 If this extension is enabled it will, by default:
-- generate a key/cert pair
+- generate a key/cert pair (`webui.key` / `webui.cert`)
 - read the Python trust store from Python certifi
 - create an intermediary bundle made from fusing our cert with the certifi trust store
-- pass bundle to requests using the `REQUESTS_CA_BUNDLE` environment variable
- 
+- pass bundle to requests using the `REQUESTS_CA_BUNDLE` environment variable, and to httpx (which Gradio 4 uses) with `SSL_CERT_FILE`
+- point the WebUI's TLS options at the generated pair, so **no TLS launch flags are needed at all**
+
+Install it, restart, and `http://localhost:7860/` becomes `https://localhost:7860/` — on whatever port you already use.
+
 ### Usecase 2 - Bring your own certificate:
-If passed an existing key/cert pair by using `--tls-keyfile` and `--tls-certfile`, the extension will try to do the same as **Usecase 1** but with your specific certificate.
-*note: if you choose this option make sure that your SDWUI server name (--server-name) matches the common name set in the certificate you pass. Otherwise you will likely encounter an exception causing your program to crash.*
+If passed an existing key/cert pair by using `--tls-keyfile` and `--tls-certfile`, the extension will try to do the same as **Usecase 1** but with your specific certificate. Your files are used as-is and are never modified or replaced.
+*note: if you choose this option make sure that your SDWUI server name (--server-name) matches the common name set in the certificate you pass. Otherwise you will likely encounter an exception causing your program to crash — adding `--disable-tls-verify` works around it.*
+
+### Remote access (`--listen`)
+The extension never enables remote access on its own. If you already launch with `--listen`, the generated certificate also covers your machine's hostname and detected LAN addresses, so `https://<your-LAN-IP>:PORT/` works from another machine — subject to the same firewall/network setup `--listen` already needed. Remote browsers get the same self-signed warning to dismiss.
 
  
 With both of these methods, by passing the certificate to Python requests as being trusted, the webui will be able to run using HTTPS. This is because the certificate will then be seen as valid by the SDWUI processes after the extension passes it to the webui.
@@ -26,7 +34,10 @@ See https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Extensions
 
 For security reasons you may encounter an error in the console upon restart after installing **if** you are running with `--listen` and do not include `--enable-insecure-extension-access`.
 
-**If you are using a relatively new version of sdwui, you will want to add `--disable-tls-verify` to your launch options if you are going with usecase 1.**
+Usecase 1 needs no extra launch flags. Older releases of this extension asked you to add `--disable-tls-verify` yourself; the extension now configures that internal check itself, so you can drop it.
+
+### Requirements
+The only dependencies are [`cryptography`](https://pypi.org/project/cryptography/) and `certifi`, installed through the normal extension installer. An already-working `cryptography` is reused as-is, and nothing belonging to the WebUI is upgraded, downgraded or removed. Earlier releases installed `certipie==0.2.0`, which pulled in an old FastAPI/Hypercorn/Trio generation and broke Gradio's imports on Python 3.13 — that dependency is gone.
 
 ### But... I'm still getting certificate errors / I'm getting warnings
 ![warning](https://i0.wp.com/DeployHappiness.com/wp-content/uploads/2019/02/01.png?resize=442%2C230&ssl=1)
