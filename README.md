@@ -14,12 +14,22 @@ If this extension is enabled it will, by default:
 - create an intermediary bundle made from fusing our cert with the certifi trust store
 - pass bundle to requests using the `REQUESTS_CA_BUNDLE` environment variable, and to httpx (which Gradio 4 uses) with `SSL_CERT_FILE`
 - point the WebUI's TLS options at the generated pair, so **no TLS launch flags are needed at all**
+- serve the WebUI over HTTP/2 (see below), so one connection carries the whole page
 
 Install it, restart, and `http://localhost:7860/` becomes `https://localhost:7860/` — on whatever port you already use.
 
 ### Usecase 2 - Bring your own certificate:
 If passed an existing key/cert pair by using `--tls-keyfile` and `--tls-certfile`, the extension will try to do the same as **Usecase 1** but with your specific certificate. Your files are used as-is and are never modified or replaced.
 *note: if you choose this option make sure that your SDWUI server name (--server-name) matches the common name set in the certificate you pass. Otherwise you will likely encounter an exception causing your program to crash — adding `--disable-tls-verify` works around it.*
+
+### HTTP/2, so the browser stops running out of connections
+Once TLS is on, the WebUI is served over **HTTP/2** through [Hypercorn](https://pypi.org/project/hypercorn/) instead of the WebUI's own HTTP/1.1 server. Nothing about the WebUI changes but the wire protocol: same app, same port, same URL, same `--listen`.
+
+Why this matters: a browser allows **six** persistent HTTP/1.1 connections to one origin, and a WebUI page keeps most of them open on streams that never end - the page's heartbeat and queue, plus whatever extensions keep open on the same origin (an event stream, an iframe with a heartbeat and queue of its own). When one of those streams stops answering, the connection it holds is gone for good and every later request from the page - a generation, a button, a poll - waits in the browser behind it until the browser is restarted. The server is fine the whole time. HTTP/2 multiplexes every request and stream of a page over **one** connection, with no six-connection rule, and browsers only speak it over TLS - which is exactly what this extension provides.
+
+What to expect in the console: `[AutoTLS] HTTPS is HTTP/2 through Hypercorn on https://...` after the WebUI starts. If Hypercorn is missing or cannot start, the WebUI stays on its own HTTP/1.1 server and the console says so; nothing else is affected. `--autotls-http1` keeps the WebUI's own server on purpose. A launch without TLS is never touched, because browsers do not speak HTTP/2 without it.
+
+Hypercorn is pure Python, installed through the normal extension installer, and pins nothing the WebUI already has.
 
 ### Remote access (`--listen`)
 The extension never enables remote access on its own. If you already launch with `--listen`, the generated certificate also covers your machine's hostname and detected LAN addresses, so `https://<your-LAN-IP>:PORT/` works from another machine — subject to the same firewall/network setup `--listen` already needed. Remote browsers get the same self-signed warning to dismiss.
@@ -37,7 +47,7 @@ For security reasons you may encounter an error in the console upon restart afte
 Usecase 1 needs no extra launch flags. Older releases of this extension asked you to add `--disable-tls-verify` yourself; the extension now configures that internal check itself, so you can drop it.
 
 ### Requirements
-The only dependencies are [`cryptography`](https://pypi.org/project/cryptography/) and `certifi`, installed through the normal extension installer. An already-working `cryptography` is reused as-is, and nothing belonging to the WebUI is upgraded, downgraded or removed. Earlier releases installed `certipie==0.2.0`, which pulled in an old FastAPI/Hypercorn/Trio generation and broke Gradio's imports on Python 3.13 — that dependency is gone.
+The dependencies are [`cryptography`](https://pypi.org/project/cryptography/), `certifi` and [`hypercorn`](https://pypi.org/project/hypercorn/) (for HTTP/2), installed through the normal extension installer. An already-working `cryptography` is reused as-is, and nothing belonging to the WebUI is upgraded, downgraded or removed. Earlier releases installed `certipie==0.2.0`, which pulled in an old FastAPI/Hypercorn/Trio generation and broke Gradio's imports on Python 3.13 — that dependency is gone.
 
 ### But... I'm still getting certificate errors / I'm getting warnings
 ![warning](https://i0.wp.com/DeployHappiness.com/wp-content/uploads/2019/02/01.png?resize=442%2C230&ssl=1)
