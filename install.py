@@ -1,8 +1,9 @@
 """Dependency setup for the AutoTLS extension.
 
-AutoTLS needs exactly two things: PyCA ``cryptography`` to build the self-signed
-key/certificate pair, and ``certifi`` for the public CA trust store it fuses that
-certificate into.
+AutoTLS needs three things: PyCA ``cryptography`` to build the self-signed
+key/certificate pair, ``certifi`` for the public CA trust store it fuses that
+certificate into, and ``hypercorn`` to serve the WebUI over HTTP/2 once TLS is on
+(see scripts/auto_tls_http2.py; without it the WebUI simply stays on HTTP/1.1).
 
 Earlier releases installed ``certipie==0.2.0`` instead.  That package pins an old
 dependency generation (FastAPI, Hypercorn, Trio 0.20-era) and installing it into a
@@ -58,3 +59,11 @@ if not cryptography_is_usable():
 
 if not launch.is_installed("certifi"):
     launch.run_pip("install certifi", "requirements for auto-tls")
+
+# Pure Python, and it pins nothing the WebUI already has: Hypercorn wants h11 (which
+# httpx and uvicorn already brought), h2, priority and wsproto.  The floor is the
+# first release that supports every Python Forge Neo runs on.
+HYPERCORN_REQUIREMENT = "hypercorn>=0.17"
+
+if not launch.is_installed("hypercorn"):
+    launch.run_pip(f'install "{HYPERCORN_REQUIREMENT}"', "requirements for auto-tls (HTTP/2)")
