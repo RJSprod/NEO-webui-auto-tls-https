@@ -27,6 +27,12 @@ Gradio 4 (Forge Neo) keeps ``start_server`` in ``gradio.http_server``; Gradio 3
 (AUTOMATIC1111) in ``gradio.networking``.  Both return ``(server_name, port,
 url, server)`` and both use ``server`` only to close it, which is the whole of
 the contract kept here.
+
+Only Hypercorn's public entry point is used - ``hypercorn.asyncio.serve`` and
+``Config`` - because the first host this ran on had a Hypercorn 0.13 left
+behind by an older dependency, and the internals differ from one release to
+the next.  Any release from 0.14 on serves; the installer brings a current one
+when what is installed is older than that.
 """
 
 import asyncio
@@ -66,6 +72,16 @@ READY_TEXT = "Running on"
 #: TLS handshake for the next click.
 KEEP_ALIVE_SECONDS = 30.0
 
+#: The oldest Hypercorn this will serve through.  Everything below is asked of
+#: its public API only, and 0.14 is the oldest release that API was tested on.
+#: install.py brings a newer one than this; the floor is what to accept when
+#: the installer could not run.
+MINIMUM_HYPERCORN = (0, 14)
+
+#: How often, and for how long in total, run_in_thread asks the port whether
+#: anything is listening yet.  A connection that is accepted is the proof.
+PROBE_INTERVAL = 0.02
+
 
 def log(message):
     print(f"{PREFIX} {message}")
@@ -92,20 +108,51 @@ def server_module():
     return None
 
 
+def hypercorn_version():
+    """The installed Hypercorn's version as a tuple of ints, or None when unknown."""
+    try:
+        import importlib.metadata
+
+        text = importlib.metadata.version("hypercorn")
+    except Exception:
+        return None
+    parts = []
+    for piece in str(text).split("."):
+        digits = ""
+        for character in piece:
+            if not character.isdigit():
+                break
+            digits += character
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
 def hypercorn_problem():
-    """Why Hypercorn cannot serve here, or None when it can."""
+    """Why Hypercorn cannot serve here, or None when it can.
+
+    The two answers a person can act on are told apart: one that is not there
+    at all, and one that is there but older than this file was written against.
+    Both are what the installer fixes on a start without --skip-install.
+    """
+    try:
+        import hypercorn  # noqa: F401
+    except Exception as exception:
+        return f"it is not installed ({type(exception).__name__}: {exception})"
+
+    version = hypercorn_version()
+    if version is not None and version < MINIMUM_HYPERCORN:
+        wanted = ".".join(str(part) for part in MINIMUM_HYPERCORN)
+        return f"version {'.'.join(str(part) for part in version)} is installed and {wanted} or newer is needed"
+
     try:
         import h2  # noqa: F401  - HTTP/2 itself; Hypercorn declares it, this checks it
-        import hypercorn.asyncio.run as run
-        import hypercorn.config  # noqa: F401
-        import hypercorn.logging  # noqa: F401
-        import hypercorn.utils as utils
+        from hypercorn.asyncio import serve  # noqa: F401
+        from hypercorn.config import Config  # noqa: F401
+        from hypercorn.logging import Logger  # noqa: F401
     except Exception as exception:
-        return f"{type(exception).__name__}: {exception}"
-
-    for module, name in ((run, "worker_serve"), (utils, "wrap_app")):
-        if not hasattr(module, name):
-            return f"{module.__name__}.{name} is missing from this Hypercorn"
+        return f"it is installed but incomplete ({type(exception).__name__}: {exception})"
 
     return None
 
@@ -117,6 +164,28 @@ def http2_declined(ssl_keyfile, ssl_certfile):
     if opt("autotls_http1", False):
         return "--autotls-http1 was given"
     return None
+
+
+def check_certificate(ssl_keyfile, ssl_certfile, ssl_keyfile_password=None):
+    """Load the pair the way Hypercorn will, before anything is bound.
+
+    A pair Hypercorn cannot load would otherwise fail inside the serving thread,
+    after its listening socket was bound and with nothing left to close it; and
+    ssl.SSLError is an OSError, which the port scan would read as "taken" and
+    try again on the next ninety-nine ports.  Raises RuntimeError, which the
+    wrapper answers with Gradio's own server - and Gradio's own words for the
+    same broken pair.
+    """
+    from hypercorn.config import Config
+
+    config = Config()
+    config.certfile = ssl_certfile
+    config.keyfile = ssl_keyfile
+    config.keyfile_password = ssl_keyfile_password
+    try:
+        config.create_ssl_context()
+    except Exception as exception:
+        raise RuntimeError(f"the certificate pair could not be loaded ({type(exception).__name__}: {exception})") from None
 
 
 def probe_port(host, port):
@@ -141,6 +210,8 @@ class Http2Server:
 
         ready = threading.Event()
 
+        # Hypercorn announces each listening socket through its logger.  Hooked
+        # here as one of two readiness signals; the other is the port itself.
         class ReadyLogger(Logger):
             async def info(self, message, *args, **kwargs):
                 if READY_TEXT in str(message):
@@ -162,58 +233,63 @@ class Http2Server:
 
         self.app = app
         self.config = config
+        self.host = host
+        self.port = port
         self.ready = ready
-        # Probed before Hypercorn binds: a taken port answers here, from a socket
-        # that is closed again, rather than from one Hypercorn made and would
-        # leave open behind the OSError.
+        # Asked here, on the caller's thread, so that a taken port is an OSError
+        # right now - the answer Gradio's own port scan is written around - and
+        # never a failure inside the serving thread.  Hypercorn binds for itself
+        # a moment later.
         probe_port(host, port)
-        self.sockets = config.create_sockets()
         self.thread = None
         self.loop = None
         self.stop = None
         self.error = None
         self.started = False
 
-    @property
-    def port(self):
-        return self.sockets.secure_sockets[0].getsockname()[1]
+    def listening(self):
+        """Whether something accepts on the port yet.  A refused connection is
+        the answer while Hypercorn is still starting; an accepted one, closed
+        again before any handshake, is the proof it is up."""
+        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        target = "127.0.0.1" if self.host in ("0.0.0.0", "") else ("::1" if self.host == "::" else self.host)
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.2)
+                sock.connect((target, self.port))
+            return True
+        except OSError:
+            return False
 
     def run_in_thread(self):
         self.thread = threading.Thread(target=self._run, name="autotls-http2", daemon=True)
         self.thread.start()
 
         deadline = time.time() + START_TIMEOUT
-        while not self.ready.is_set() and self.thread.is_alive() and time.time() < deadline:
-            time.sleep(0.005)
-
-        if self.ready.is_set() and self.thread.is_alive():
-            self.started = True
-            return
+        while self.thread.is_alive() and time.time() < deadline:
+            if self.ready.is_set() or self.listening():
+                self.started = True
+                return
+            time.sleep(PROBE_INTERVAL)
 
         self.close()
-        why = self.error if self.error is not None else "no ready signal within %.0fs" % START_TIMEOUT
+        why = self.error if self.error is not None else "nothing was listening within %.0fs" % START_TIMEOUT
         raise RuntimeError(f"Hypercorn did not start: {why}")
 
     def _run(self):
         try:
             asyncio.run(self._serve())
         except BaseException as exception:  # reported to the thread that asked, never raised into nothing
-            self.error = exception
-        finally:
-            self._close_sockets()
+            # The words, not the exception: an exception keeps its traceback,
+            # and the traceback keeps every frame - and every socket - alive.
+            self.error = f"{type(exception).__name__}: {exception}"
 
     async def _serve(self):
-        from hypercorn.asyncio.run import worker_serve
-        from hypercorn.utils import wrap_app
+        from hypercorn.asyncio import serve
 
         self.loop = asyncio.get_running_loop()
         self.stop = asyncio.Event()
-        await worker_serve(
-            wrap_app(self.app, self.config.wsgi_max_body_size, "asgi"),
-            self.config,
-            sockets=self.sockets,
-            shutdown_trigger=self.stop.wait,
-        )
+        await serve(self.app, self.config, shutdown_trigger=self.stop.wait)
 
     def close(self):
         loop, stop = self.loop, self.stop
@@ -224,15 +300,6 @@ class Http2Server:
                 pass  # the loop has already gone
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=CLOSE_TIMEOUT)
-        self._close_sockets()
-
-    def _close_sockets(self):
-        for group in (self.sockets.secure_sockets, self.sockets.insecure_sockets, self.sockets.quic_sockets):
-            for sock in group:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
 
 
 def start_http2(module, app, server_name, server_port, ssl_keyfile, ssl_certfile, ssl_keyfile_password):
@@ -245,6 +312,8 @@ def start_http2(module, app, server_name, server_port, ssl_keyfile, ssl_certfile
     url_host_name = "localhost" if server_name == "0.0.0.0" else server_name
     # http://[::1]:port/ is a valid browser address and not a valid bind address.
     host = server_name[1:-1] if server_name.startswith("[") and server_name.endswith("]") else server_name
+
+    check_certificate(ssl_keyfile, ssl_certfile, ssl_keyfile_password)
 
     ports = [server_port] if server_port is not None else range(first_port, first_port + port_count)
     for port in ports:
@@ -282,8 +351,8 @@ def install(module=None):
     problem = hypercorn_problem()
     if problem is not None:
         error(
-            f"HTTP/2 is off: Hypercorn could not be used ({problem}); the WebUI keeps HTTP/1.1"
-            " - restart without --skip-install so the extension installer can add it"
+            f"HTTP/2 is off: Hypercorn {problem}; the WebUI keeps HTTP/1.1"
+            " - a start without --skip-install lets the extension installer put a current Hypercorn in place"
         )
         return False
 

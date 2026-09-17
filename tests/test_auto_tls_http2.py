@@ -35,6 +35,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 from argparse import Namespace
 
 from cryptography import x509
@@ -266,8 +267,34 @@ class AutoTLSHttp2TestCase(unittest.TestCase):
 
         self.assertIs(fake.module.start_server, fake.original)
         self.assertIn("Hypercorn", self.stderr)
+        self.assertIn("not installed", self.stderr)
         self.assertIn("HTTP/1.1", self.stderr)
         self.assertIn("--skip-install", self.stderr)
+
+    @unittest.skipUnless(HAVE_HYPERCORN, "hypercorn is not installed")
+    def test_a_hypercorn_older_than_the_floor_is_named_and_leaves_gradio_alone(self):
+        # The first host this ran on had the Hypercorn 0.13 that the old certipie
+        # dependency pinned, and the message blamed a missing install.  The
+        # version has to be named, and the way out has to be the right one.
+        fake = self.fake_gradio()
+        with unittest.mock.patch("importlib.metadata.version", return_value="0.13.2"):
+            self.run_script()
+
+        self.assertIs(fake.module.start_server, fake.original)
+        self.assertIn("0.13.2", self.stderr)
+        self.assertIn("0.14 or newer", self.stderr)
+        self.assertIn("--skip-install", self.stderr)
+        self.assertNotIn("not installed", self.stderr)
+
+    @unittest.skipUnless(HAVE_HYPERCORN, "hypercorn is not installed")
+    def test_only_hypercorns_public_entry_points_are_used(self):
+        # Hypercorn's internals moved between releases (wrap_app, worker_serve's
+        # sockets); the public serve() and Config have not.  Nothing else is
+        # allowed in, so the next host with an unexpected release still serves.
+        with open(HTTP2_SCRIPT, encoding="utf-8") as handle:
+            source = handle.read()
+        for internal in ("wrap_app", "worker_serve", "create_sockets", "hypercorn.utils", "app_wrappers"):
+            self.assertNotIn(internal, source, internal)
 
     # what still goes to gradio's own server -----------------------------------
 
