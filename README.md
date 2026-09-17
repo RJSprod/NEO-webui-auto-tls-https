@@ -29,7 +29,7 @@ Why this matters: a browser allows **six** persistent HTTP/1.1 connections to on
 
 What to expect in the console: `[AutoTLS] HTTPS is HTTP/2 through Hypercorn on https://...` after the WebUI starts. If Hypercorn is missing or cannot start, the WebUI stays on its own HTTP/1.1 server and the console says so; nothing else is affected. `--autotls-http1` keeps the WebUI's own server on purpose. A launch without TLS is never touched, because browsers do not speak HTTP/2 without it.
 
-Hypercorn is pure Python, installed through the normal extension installer, and pins nothing the WebUI already has.
+Hypercorn is pure Python, installed through the normal extension installer, and pins nothing the WebUI already has. A Hypercorn older than 0.17 that an earlier dependency left in the venv (the old `certipie` pinned 0.13) is upgraded by the installer on the next start without `--skip-install`; any 0.14 or newer serves in the meantime.
 
 ### Remote access (`--listen`)
 The extension never enables remote access on its own. If you already launch with `--listen`, the generated certificate also covers your machine's hostname and detected LAN addresses, so `https://<your-LAN-IP>:PORT/` works from another machine — subject to the same firewall/network setup `--listen` already needed. Remote browsers get the same self-signed warning to dismiss.

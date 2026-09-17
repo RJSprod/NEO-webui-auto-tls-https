@@ -64,6 +64,49 @@ if not launch.is_installed("certifi"):
 # httpx and uvicorn already brought), h2, priority and wsproto.  The floor is the
 # first release that supports every Python Forge Neo runs on.
 HYPERCORN_REQUIREMENT = "hypercorn>=0.17"
+HYPERCORN_MINIMUM = (0, 17)
 
-if not launch.is_installed("hypercorn"):
-    launch.run_pip(f'install "{HYPERCORN_REQUIREMENT}"', "requirements for auto-tls (HTTP/2)")
+
+def hypercorn_version():
+    """The installed Hypercorn's version as a tuple of ints, or None when there is none."""
+    try:
+        import importlib.metadata
+
+        text = importlib.metadata.version("hypercorn")
+    except Exception:
+        return None
+    parts = []
+    for piece in str(text).split("."):
+        digits = ""
+        for character in piece:
+            if not character.isdigit():
+                break
+            digits += character
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
+def hypercorn_is_usable() -> bool:
+    """Whether the installed Hypercorn is one scripts/auto_tls_http2.py can serve through.
+
+    A version check on purpose, where cryptography above gets a capability check:
+    the old certipie dependency pinned Hypercorn 0.13 into venvs that still carry
+    it, and "some Hypercorn is installed" is exactly the question that let that
+    copy through.  Older than the floor is upgraded; the floor and newer is kept.
+    """
+    version = hypercorn_version()
+    if version is None or version < HYPERCORN_MINIMUM:
+        return False
+    try:
+        from hypercorn.asyncio import serve  # noqa: F401
+        from hypercorn.config import Config  # noqa: F401
+        import h2  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+if not hypercorn_is_usable():
+    launch.run_pip(f'install --upgrade "{HYPERCORN_REQUIREMENT}"', "requirements for auto-tls (HTTP/2)")
