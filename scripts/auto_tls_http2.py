@@ -72,6 +72,19 @@ READY_TEXT = "Running on"
 #: TLS handshake for the next click.
 KEEP_ALIVE_SECONDS = 30.0
 
+#: How many requests one connection may carry before Hypercorn closes it.
+#: Hypercorn's own figure is a thousand, sized for HTTP/1.1, where a connection
+#: carries one request at a time and a thousand is a long life.  Over HTTP/2
+#: the page's ONE connection carries every request the page ever makes - each
+#: progress poll, each thumbnail, each click - and the thousandth arrives within
+#: minutes of a Generate.  On it Hypercorn sends GOAWAY, then reads the browser's
+#: next frame as a protocol error and closes the connection under the streams
+#: still open on it: the page's heartbeat, and the queue stream a generation's
+#: result travels on.  Gradio's client answers a broken queue stream with
+#: "Connection errored out." and drops the finished image.  The connection is
+#: meant to live as long as the page, so the figure is effectively no limit.
+KEEP_ALIVE_MAX_REQUESTS = 2**31 - 1
+
 #: The oldest Hypercorn this will serve through.  Everything below is asked of
 #: its public API only, and 0.14 is the oldest release that API was tested on.
 #: install.py brings a newer one than this; the floor is what to accept when
@@ -225,6 +238,7 @@ class Http2Server:
         config.keyfile_password = ssl_keyfile_password
         config.alpn_protocols = ["h2", "http/1.1"]
         config.keep_alive_timeout = KEEP_ALIVE_SECONDS
+        config.keep_alive_max_requests = KEEP_ALIVE_MAX_REQUESTS
         # Hypercorn's own announcements are replaced by the one line below; its
         # warnings and errors still reach the console.
         config.loglevel = "WARNING"

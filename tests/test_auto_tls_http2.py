@@ -15,12 +15,15 @@ What is asserted, in order of importance:
 * the port rules are Gradio's: a taken port is skipped in a scan and refused
   when it was asked for by number;
 * ``close()`` frees the port, which a UI reload depends on;
+* a stream opened on the page's connection outlives a thousand other requests
+  on it - Hypercorn's default would close the connection, and the page, there;
 * a real ``gr.Blocks`` launched through the wrap comes up, answers over HTTP/2,
   closes, and launches again on the same port.
 
 Run with ``python tests/test_auto_tls_http2.py`` or ``pytest tests/test_auto_tls_http2.py``.
 """
 
+import asyncio
 import contextlib
 import datetime
 import http.client
@@ -123,6 +126,22 @@ async def tiny_app(scope, receive, send):
         (b"x-http-version", scope.get("http_version", "?").encode()),
     ]})
     await send({"type": "http.response.body", "body": body})
+
+
+async def ticking_app(scope, receive, send):
+    """tiny_app plus ``/stream``: a response that never ends, one tick every 50 ms.
+
+    The shape of Gradio's heartbeat and queue streams - what a page keeps open
+    on its connection for as long as the page is open.
+    """
+    if scope["type"] == "http" and scope["path"] == "/stream":
+        await send({"type": "http.response.start", "status": 200, "headers": [
+            (b"content-type", b"text/event-stream"),
+        ]})
+        while True:
+            await send({"type": "http.response.body", "body": b"data: tick\n\n", "more_body": True})
+            await asyncio.sleep(0.05)
+    await tiny_app(scope, receive, send)
 
 
 class FakeGradioServer:
@@ -367,6 +386,37 @@ class AutoTLSHttp2TestCase(unittest.TestCase):
 
         self.assertEqual((response.status_code, response.http_version, response.text), (200, "HTTP/2", "ok"))
         self.assertEqual(response.headers["x-http-version"], "2")
+
+    @unittest.skipUnless(HAVE_HYPERCORN and HAVE_HTTPX_H2, "hypercorn or an HTTP/2 client is not installed")
+    def test_a_stream_on_the_pages_connection_outlives_a_thousand_requests(self):
+        # Hypercorn closes a connection after keep_alive_max_requests, a thousand
+        # by default - sized for HTTP/1.1, where that is one request at a time.
+        # Over HTTP/2 it is the page's only connection, so the thousandth
+        # progress poll or thumbnail sent GOAWAY and took the queue stream down
+        # with it: "Connection errored out." in the browser, with the image
+        # already generated on the server.  The connection lives as long as the
+        # page does, and a stream opened on it is still flowing well past that.
+        import httpx
+
+        fake = self.fake_gradio()
+        key_path, cert_path = self.pair()
+        self.run_script()
+        port = free_port()
+        server = fake.module.start_server(ticking_app, None, port, key_path, cert_path)[3]
+        self.servers.append(server)
+
+        context = ssl.create_default_context(cafile=cert_path)
+        with httpx.Client(http2=True, verify=context, timeout=10) as client:
+            with client.stream("GET", f"https://localhost:{port}/stream") as stream:
+                self.assertEqual(stream.http_version, "HTTP/2")
+                ticks = stream.iter_raw()
+                self.assertTrue(next(ticks))
+                for _ in range(1100):
+                    response = client.get(f"https://localhost:{port}/")
+                    self.assertEqual((response.status_code, response.http_version), (200, "HTTP/2"))
+                # The same connection, and the stream on it is still alive.
+                self.assertTrue(next(ticks))
+                self.assertTrue(next(ticks))
 
     @unittest.skipUnless(HAVE_HYPERCORN, "hypercorn is not installed")
     def test_close_frees_the_port(self):

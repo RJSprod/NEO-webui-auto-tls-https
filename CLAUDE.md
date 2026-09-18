@@ -9,7 +9,7 @@ written nowhere else.
 
 ```
 python tests/test_auto_tls.py        # 37 checks: certificates, trust, the modes
-python tests/test_auto_tls_http2.py  # 16 checks: the wrap, the fallbacks, real HTTP/2
+python tests/test_auto_tls_http2.py  # 17 checks: the wrap, the fallbacks, real HTTP/2
 python tests/test_install.py         #  5 checks: what the installer asks pip for
 ```
 
@@ -50,6 +50,16 @@ left to close it. `check_certificate()` runs first, on the caller's thread.
 keeps the function in `gradio.http_server`, Gradio 3 in `gradio.networking`.
 Every script module runs again on a UI reload, so the wrap checks for itself
 before wrapping.
+
+**The page's connection must outlive a thousand requests.** Hypercorn closes a
+connection after `keep_alive_max_requests` (1000 by default) - on HTTP/2 that is
+the page's only connection, reached within minutes of a Generate, and Hypercorn
+does not honour its own GOAWAY gracefully: the browser's next frame is read as a
+protocol error and the connection is closed under the heartbeat and queue
+streams still open on it. Gradio's client answers a broken queue stream with
+*Connection errored out.* and drops the finished image. `KEEP_ALIVE_MAX_REQUESTS`
+lifts the cap; the regression test opens a stream and makes 1,100 requests past
+it. Anything that closes the connection on a schedule is this bug again.
 
 **Never let this take the WebUI down.** Every failure path falls back to
 Gradio's own server and says which; `--autotls-http1` is the user's one-flag
